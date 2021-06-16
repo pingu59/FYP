@@ -26,10 +26,11 @@ import random
 from scipy import interpolate
 from scipy.sparse.linalg import svds
 import pickle
-import ps_utils
 from scipy.signal import convolve
 from numpy import linalg
 import pyheif
+import trimesh
+from plyfile import PlyData, PlyElement
 
 
 # Camera specifications
@@ -51,6 +52,8 @@ coeff = ipad_height_pixel/depth_height
 
 facial_midpoints = np.array([27, 28, 29, 30, 33, 51, 62, 66, 57, 8])
 #in the ibug68 definition, starting from zero, from top to down
+facial_leftpoints = [22, 23, 24, 25, 26, 34, 35, 52, 53, 54, 55, 56, 63, 64, 65] + list(range(9, 17)) #42, 43, 44, 45, 46, 47
+facial_rightpoints = [17, 18, 19, 20, 21, 3, 31, 32, 48, 49, 50, 58, 59, 60, 61, 67] + list(range(8)) #36, 37, 38, 39, 40, 41
 
 
 #Functions for finding landmarks
@@ -77,7 +80,7 @@ def fit_landmark(pic):
                                 return_costs=False)
     return result
 
-# Functions for creating .obj
+# Functions for creating .obj, modified from https://github.com/CapObvios/Depth-Map-Visualizer
 def create_mtl(mtlPath, matName, texturePath):
     if max(mtlPath.find('\\'), mtlPath.find('/')) > -1:
         os.makedirs(os.path.dirname(mtlPath), exist_ok=True)
@@ -99,7 +102,7 @@ def vete(v, vt):
 def calc_surface_normal(v1, v2, v3):
     return np.cross((v2 - v1), (v3 - v1))
     
-def create_obj(depth, objPath, mtlPath, matName, mask, useMaterial = True, up_side_down = False):
+def create_obj(depth, objPath, mtlPath, matName, mask, useMaterial = True, up_side_down = False, no_vt= False):
     img = depth
     h = depth_height
     w = depth_width 
@@ -111,7 +114,7 @@ def create_obj(depth, objPath, mtlPath, matName, mask, useMaterial = True, up_si
         os.makedirs(os.path.dirname(mtlPath), exist_ok=True)
     
     with open(objPath,"w") as f:    
-        if useMaterial:
+        if useMaterial and not no_vt:
             f.write("mtllib " + mtlPath.split('/')[-1] + "\n")
             f.write("usemtl " + matName + "\n")
 
@@ -124,12 +127,12 @@ def create_obj(depth, objPath, mtlPath, matName, mask, useMaterial = True, up_si
         if up_side_down:
             for u in range(h):
                 for v in range(w):
-                    d = 1./ img.iloc[v, h - 1 - u]
+                    d = 1./ img[h - 1 - u, ]
                     heat_map[u, v] = d
         else:
             for u in range(h):
                 for v in range(w):
-                    d =  1./ img.iloc[-v, u]
+                    d =  1./ img[u, -v]
                     heat_map[u, v] = d
         #Apply gaussian smooth:
         heat_map_no_smooth = heat_map
@@ -165,18 +168,22 @@ def create_obj(depth, objPath, mtlPath, matName, mask, useMaterial = True, up_si
                 y = -t*y*norm
                 z = -t*z*norm    
                 location_no_smooth[u, v] = np.array([x, y, z])
-
-        for v in range(w):
-            for u in range(h):
-                f.write("vt " + str(v/w) + " " + str((h - u - 1)/h) + "\n")
+        if not no_vt:
+            for v in range(w):
+                for u in range(h):
+                    f.write("vt " + str(v/w) + " " + str((h - u - 1)/h) + "\n")
         for v in range(w - 1):
             for u in range(h - 1):
                 v1 = ids[u, v]; v2 = ids[u+1, v]; v3 = ids[u, v+1]; v4 = ids[u+1, v+1]
                 l1 = location[u, v]; l2 = location[u+1, v]; l3 = location[u, v+1]; l4 = location[u+1, v+1]
                 if v1 == 0 or v2 == 0 or v3 == 0 or v4 == 0:
                     continue
-                f.write("f " + vete(v2,v2) + " " + vete(v1,v1) + " " + vete(v3,v3) + "\n")
-                f.write("f " + vete(v2,v2) + " " + vete(v3,v3) + " " + vete(v4,v4) + "\n")
+                if no_vt:
+                    f.write("f " + str(v2) + " " + str(v1) + " " + str(v3) + "\n")
+                    f.write("f " + str(v2) + " " + str(v3) + " " + str(v4) + "\n")
+                else:
+                    f.write("f " + vete(v2,v2) + " " + vete(v1,v1) + " " + vete(v3,v3) + "\n")
+                    f.write("f " + vete(v2,v2) + " " + vete(v3,v3) + " " + vete(v4,v4) + "\n")
                 normal[u, v] = (calc_surface_normal(l2, l1, l3) + calc_surface_normal(l2, l3, l4))/2
                 normal[u, v] /= np.linalg.norm(normal[u, v])
                 normal[u, v, 0] = - normal[u, v, 0]
@@ -216,18 +223,40 @@ def landmark_one_object(texturePath, mtlPath, depth, objPath, mask,
                                                     matName, up_side_down)
     landmarks = fit_landmark(texturePath)
     ibug = landmarks.final_shape.points
-    points = create_picked_points(pickedPointsPath, ibug, objPath, location)
-    return landmarks, points, ids, location, ibug, normal, location_no_smooth
+    points = create_picked_points(pickedPointsPath, ibug, objPath, location_no_smooth)
+    # mesh = trimesh.load_mesh(objPath)
+    # trimesh.smoothing.filter_humphrey(mesh, iterations=20)
+    # faces = mesh.faces
+    # face_normals = mesh.face_normals
+    # trimesh.geometry.mean_vertex_normals(mesh.vertices.shape[0], faces, face_normals)
+    # vertex_normals = mesh.vertex_normals
+    # vertices = mesh.vertices
+    # normals_smoothed = np.zeros((ids.shape[0], ids.shape[1], 3))
+    # for i in range(len(vertices)):
+    #    x, y, _ = vertices[i]
+    #    pixel_x = int(x /pixel_per_meter)
+    #    pixel_y = int(y /pixel_per_meter)
+    #    normals_smoothed[pixel_x, pixel_y] = vertex_normals[i]
+    # plt.figure()
+    # plt.imshow(normals_smoothed)
+    # plt.show()
+    normals_smoothed = cv2.GaussianBlur(normal,(9, 9),0)
+    return landmarks, points, ids, location, ibug, normals_smoothed, location_no_smooth
 
-def find_affine(points_from, points_to, use_ibug68 = False):
+def find_affine(points_from, points_to, use_ibug68 = False, points_toleft=True):
     valid_points_from = []
     valid_points_to = []
     if use_ibug68:
         start = 0
     else:
         start = 17
+    if points_toleft:
+        allowed_landmark = facial_leftpoints + facial_midpoints.tolist()
+    else:
+        allowed_landmark = facial_rightpoints + facial_midpoints.tolist()
+    
     for i in range(start, points_from.shape[0]): #some points can be outside of the face area hence have location (0, 0, 0)
-        if points_from[i].sum() != 0 and points_to[i].sum() != 0:
+        if i in allowed_landmark and points_from[i].sum() != 0 and points_to[i].sum() != 0:
             valid_points_from.append(points_from[i])
             valid_points_to.append(points_to[i])
     p_from = np.stack(valid_points_from)
@@ -258,7 +287,7 @@ def merge_mtl(mtlPath, matNames, texturePaths):
             f.write("map_Ka " + texturePaths[i] + "\n"  )
             f.write("map_Kd " + texturePaths[i] + "\n"  )
 
-def merge_object(out, mtlPath, pointss, locations, idss, matNames, texturePaths):
+def merge_object(out, mtlPath, pointss, locations, idss, matNames, texturePaths, orientation):
     # all objects affine to the first object
     h = depth_height
     w = depth_width
@@ -272,7 +301,7 @@ def merge_object(out, mtlPath, pointss, locations, idss, matNames, texturePaths)
         for u in range(h):
             ls_affine[0, u, v] = ls[0, u, v]
     for i in range(1, num_objects):
-        A = find_affine(pointss[i], pointss[0], use_ibug68 = False)
+        A = find_affine(pointss[i], pointss[0], use_ibug68 = False, points_toleft=orientation[i-1])
         for v in range(w):
             for u in range(h):
                 ls_affine[i, u, v] = A @ls[i, u, v]
@@ -303,8 +332,8 @@ def merge_object(out, mtlPath, pointss, locations, idss, matNames, texturePaths)
                     f.write("f " + vete(v2,v2) + " " + vete(v3,v3) + " " + vete(v4,v4) + "\n")
         return ls_affine
     
-def affine_object(p_from, p_to, location_from, out, ids):
-    A = find_affine(p_from, p_to, use_ibug68 = False)
+def affine_object(p_from, p_to, location_from, out, ids, orientation):
+    A = find_affine(p_from, p_to, use_ibug68 = False, points_toleft=orientation)
     h = depth_height
     w = depth_width #img.shape[0]
     l1 = np.ones((h, w, 4))
@@ -373,6 +402,21 @@ def get_input(input_dir, color="L"): # L-intensity RGB-different channels
         ims += (I,)
     return np.column_stack(ims), (imx, imy)
 
+# https://stackoverflow.com/questions/45142959/calculate-rotation-matrix-to-align-two-vectors-in-3d-space
+def rotation_matrix_from_vectors(vec1, vec2):
+    """ Find the rotation matrix that aligns vec1 to vec2
+    :param vec1: A 3d "source" vector
+    :param vec2: A 3d "destination" vector
+    :return mat: A transform matrix (3x3) which when applied to vec1, aligns it with vec2.
+    """
+    a, b = (vec1 / np.linalg.norm(vec1)).reshape(3), (vec2 / np.linalg.norm(vec2)).reshape(3)
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    s = np.linalg.norm(v)
+    kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
+    return rotation_matrix
+
 def surface_normal_correction(I, size, mask, normal_depth, show_detail = True):
     h, w = size
     print(I.shape)
@@ -381,68 +425,88 @@ def surface_normal_correction(I, size, mask, normal_depth, show_detail = True):
     albedo = np.linalg.norm(surface_normal, axis = -1)
     surface_normal *= np.stack([mask, mask, mask], axis = 2).astype(float)
     surface_normal /= (albedo.reshape(h, w, 1) + 1e-10) #for numeric stability
-    normal_depth_print = (normal_depth + 1) / 2
+    normal_depth_print = ((normal_depth + 1) / 2).astype(np.float32)
 
     if show_detail:
         plt.figure()
         plt.imshow(normal_depth_print)
+        plt.imsave("./svd/depth.png", normal_depth_print, cmap = "gray")
         plt.figure()
         plt.imshow(normal_depth_print[:, :, 0], cmap = "Greys")
+        plt.imsave("./svd/depth_x.png", normal_depth_print[:, :, 0], cmap = "gray")
         plt.title("2-D image for Normal X - depth")
         plt.figure()
         plt.imshow(normal_depth_print[:, :, 1], cmap = "Greys")
+        plt.imsave("./svd/depth_y.png", normal_depth_print[:, :, 1], cmap = "gray")
         plt.title("2-D image for Normal Y - depth")
         plt.figure()
         plt.imshow(normal_depth_print[:, :, 2], cmap = "Greys")
+        plt.imsave("./svd/depth_z.png", normal_depth_print[:, :, 2], cmap = "gray")
         plt.title("2-D image for Normal Z - depth")
         plt.show()
 
     surface_normal_print = (surface_normal + 1)/ 2
+    surface_normal_print = surface_normal_print.astype(np.float32)
     if show_detail:
         plt.figure()
         plt.imshow(surface_normal_print)
         plt.title("2-D image for Normal")
+        plt.imsave("./svd/svd.png", surface_normal_print, cmap = "gray")
         plt.figure()
         plt.imshow(surface_normal_print[:, :, 0], cmap = "Greys")
         plt.title("2-D image for Normal X")
+        plt.imsave("./svd/svd_x.png", surface_normal_print[:, :, 0], cmap = "gray")
         plt.figure()
         plt.imshow(surface_normal_print[:, :, 1], cmap = "Greys")
+        plt.imsave("./svd/svd_y.png", surface_normal_print[:, :, 1], cmap = "gray")
         plt.title("2-D image for Normal Y")
         plt.figure()
         plt.imshow(surface_normal_print[:, :, 2], cmap = "Greys")
+        plt.imsave("./svd/svd_z.png", surface_normal_print[:, :, 2], cmap = "gray")
         plt.title("2-D image for Normal Z")
         plt.show()
     
     #finding u in the standard x, y, z basis:
-    nd = cv2.resize(normal_depth.copy(), dsize=(int(ipad_width_pixel), int(ipad_height_pixel)), interpolation=cv2.INTER_CUBIC)
+    nd = cv2.resize(normal_depth.copy(), dsize=(w, h), interpolation=cv2.INTER_CUBIC)
     nd = nd.reshape(h * w, 3)
     sf = surface_normal.reshape(h * w, 3).transpose()
     svd_result_base = np.zeros((3,3))
-    
     for i in range(3):
         result, _, _, _ = np.linalg.lstsq(nd, sf[i], rcond=None)
         svd_result_base[i] = result / np.linalg.norm(result)
-    
-    normal_corrected = np.linalg.inv(svd_result_base).dot(sf).T.reshape(h, w, 3)    
-    normal_corrected_print = np.clip((normal_corrected + 1) / 2, a_min = 0, a_max=1)
+    normal_corrected = np.linalg.inv(svd_result_base).dot(sf).T.reshape(h, w, 3)
+    # average_depth = nd.mean(axis=0)
+    # average_normal = normal_corrected.mean(axis=0)
+    # normal_corrected = normal_corrected.reshape(h, w, 3)
+    # r = rotation_matrix_from_vectors(average_normal, average_depth)
+    # print(r)
+    # normal_corrected = np.einsum('ijk, kk->ijk', normal_corrected, r)
+    normal_corrected /= np.linalg.norm(normal_corrected, axis=-1).reshape(normal_corrected.shape[0], normal_corrected.shape[1], 1)
+    normal_corrected *= mask.reshape(mask.shape[0], mask.shape[1], 1)
+    normal_corrected_print = replaceNan(np.clip((normal_corrected + 1) / 2, a_min = 0, a_max=1).astype(np.float32))
+
+    print(normal_corrected_print.shape)
     
     plt.figure()
     plt.imshow(normal_corrected_print, cmap = "Greys")
-    plt.imsave("./normals/all.png", normal_corrected_print)
+    plt.imsave("./svd/c_svd.png", normal_corrected_print, cmap = "gray")
+    plt.imsave("./svd/c_svd_x.png", normal_corrected_print[:, :, 0], cmap = "gray")
+    plt.imsave("./svd/c_svd_y.png", normal_corrected_print[:, :, 1], cmap = "gray")
+    plt.imsave("./svd/c_svd_z.png", normal_corrected_print[:, :, 2], cmap = "gray")
     plt.title("2-D image for Normal - corrected")
-    
+
     if show_detail:
         plt.figure()
         plt.imshow(normal_corrected_print[:, :, 0], cmap = "Greys")
-        plt.imsave("./normals/X.png", normal_corrected_print[:, :, 0], cmap = "gray")
+        plt.imsave("./svd/c_svd_x.png", normal_corrected_print[:, :, 0], cmap = "gray")
         plt.title("2-D image for Normal X  - corrected")
         plt.figure()
         plt.imshow(normal_corrected_print[:, :, 1], cmap = "Greys")
-        plt.imsave("./normals/Y.png", normal_corrected_print[:, :, 1], cmap = "gray")
+        plt.imsave("./svd/c_svd_y.png", normal_corrected_print[:, :, 1], cmap = "gray")
         plt.title("2-D image for Normal Y  - corrected")
         plt.figure()
         plt.imshow(normal_corrected_print[:, :, 2], cmap = "Greys")
-        plt.imsave("./normals/Z.png", normal_corrected_print[:, :, 2], cmap = "gray")
+        plt.imsave("./svd/c_svd_z.png", normal_corrected_print[:, :, 2], cmap = "gray")
         plt.title("2-D image for Normal Z - corrected ")
     plt.show()
     return normal_corrected
@@ -496,25 +560,15 @@ def bump_object(out, mtlPath, location, matName, texturePath, displacement_map, 
 
 #beyond lambert
 # modified from https://gist.github.com/asanakoy/c82420afdab4d5eaa78c9f9481e462e1
-# implementation of RGB2SUV http://vision.ucsd.edu/~spmallick/research/suv/index.html
 
 '''
-explainations from reddit :
-I found some code! The zip file contains two different implementations of rgb2suv.m and suv2rgb.m 
-( one by me and one by my co-author Dr. Todd Zickler ). I have also included a 16 bit rendered PNG 
-file ( sphere.png ) with specular highlight. Please note that the method works when the images are 
-linear ( most images are not linear. i.e. the pixel which is double the intensity of another pixel 
-may actually be reflecting more than double the intensity of light ). If the images are not linear,
-you may still get reasonable results, but applying a gamma correction will help. Also, with 8-bit 
-images, the U and V channels may be very noisy.
+explainations found reddit :
+    You can imagine rotating the R axis of the RGB color space so it aligns with the S direction.  --reddit
+    https://www.reddit.com/r/computervision/comments/5t078u/suv_color_space/
 
 '''
 
 def get_rot_mat(effective_source, unit):
-    '''
-    You can imagine rotating the R axis of the RGB color space so it aligns with the S direction.  --reddit
-    https://www.reddit.com/r/computervision/comments/5t078u/suv_color_space/
-    '''
     #            from              to
     v = np.cross(effective_source, unit)
     c = effective_source.dot(unit)
@@ -639,13 +693,13 @@ def get_heic(addr):
     return np.rot90(image, 3)
 
 #exposure ascending order
-def get_hdr_image(base_name, exposures=[-2., -1., 0., 1.]):
+def get_hdr_image(base_name, exposures=[0., 1., 2., 3.]):
     images = []
     times = []
     for e in exposures:
         image = get_heic(base_name + str(int(e)) + '.HEIC')
         images.append(image)
-        times.append(2. ** e)
+        times.append(2. ** (e - 2))
     times = np.asarray(times, dtype=np.float32)
     calibrate = cv2.createCalibrateDebevec()
     response = calibrate.process(images, times)
@@ -659,3 +713,55 @@ def get_hdr_image(base_name, exposures=[-2., -1., 0., 1.]):
     hdr = min_max_normalization(hdr)
     cv2.imwrite(base_name + str(int(e)) + '_normalized.hdr', cv2.cvtColor(hdr, cv2.COLOR_RGB2BGR))
     return  hdr #fusion #min_max_normalization(hdr) #ldr
+
+def replaceNan(m):
+    where_are_NaNs = np.isnan(m)
+    m[where_are_NaNs] = 0
+    where_are_infs = np.isposinf(m)
+    m[where_are_infs] = 1
+    where_are_neginfs = np.isneginf(m)
+    m[where_are_neginfs] = -1
+    return m
+
+def gamma_correction(image, gamma=2.2):
+    return np.power(image, 1./gamma)
+    
+def create_ply(normal, texture, location, addr):
+    w = depth_width
+    h = depth_height
+    color = np.clip(cv2.resize(texture.copy(), dsize=(w, h)) * 255., 0, 255).astype(int)
+    size = (h - 1) * 2 * (w - 1)
+    color = np.repeat(color[:-1, :-1], 2, axis=0).reshape((size, 3)) 
+    location_mid = cv2.resize(location.copy().astype('float32'), dsize=(w, h))
+    normal_mid = cv2.resize(normal.astype('float32'), dsize=(w, h))
+    normal_mid = normal_mid.reshape(h * w, 3)
+    vertex = location_mid.reshape(h * w, 3)
+    vertex = np.asarray(list(zip(vertex[:,0], vertex[:,1], vertex[:,2], normal_mid[:, 0], normal_mid[:, 1], normal_mid[:, 2]))).flatten()
+    vertex.dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4')]
+
+    face_id = np.zeros(((h - 1) * 2, w - 1, 3), dtype=int)
+    for i in range(h - 1):
+        for j in range(w - 1):
+            v1 = int(i * w + j)
+            v2 = int((i + 1) * w + j)
+            v3 = int(i * w + j + 1)
+            v4 = int((i + 1) * w + j + 1)
+            face_id[i * 2, j, :3] = np.asarray([(v2, v1, v3)])
+            face_id[i * 2 + 1, j, :3] = np.asarray([(v2, v3, v4)])
+    face_id = face_id.reshape(size, 3).astype(int)
+    face = np.zeros(size, dtype=[('vertex_indices', 'i4', (3,)),
+                            ('red', 'u1'), ('green', 'u1'),
+                            ('blue', 'u1')])
+    for i in range(size):
+        face[i] = ([face_id[i, 0], face_id[i, 1], face_id[i, 2]], color[i, 0], color[i, 1], color[i, 2])
+    plydata = PlyData(
+                [
+                    PlyElement.describe(
+                        vertex, 'vertex'
+                    )
+                    ,
+                    PlyElement.describe(face, 'face')
+                ],
+                text=False, byte_order='>'
+            )
+    plydata.write(addr)

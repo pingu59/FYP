@@ -16,6 +16,9 @@ from scipy.sparse.linalg import svds
 import pickle
 import mat73
 
+'''
+Not in use -- Open3D depth to mesh implementation
+'''
 
 # pixel_per_meter = 4801.4
 # ipad_height_pixel = 1440.
